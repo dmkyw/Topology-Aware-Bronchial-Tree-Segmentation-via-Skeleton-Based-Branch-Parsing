@@ -115,7 +115,7 @@ Contains ordered anatomical labels
 ## 🔬 Method Highlights
 Skeletonization via kimimaro
 Graph traversal (BFS, shortest path)
-PCA-based orientation estimation
+Physical RAS orientation (superior, right, anterior)
 Branch classification using geometric heuristics
 Cranial direction → B1
 Anterior/Posterior → B2 / B3
@@ -128,6 +128,38 @@ No deep learning model is used.
 Input bronchial tree should be reasonably clean (e.g., from TotalSegmentator)
 Extremely noisy segmentations may affect branch detection
 Left B7 is not defined (consistent with anatomical convention)
+
+### Input and geometry requirements
+
+- `--input` must be one 3D scalar NRRD labelmap. The selected airway voxels are those equal to `--airway-value` (default `1`). Multi-layer/4D Slicer segmentations must be exported as a single 3D mask first.
+- The mask must contain observed branching. A single tube without graph junctions produces a structured `NO_BRANCH_POINTS` failure rather than fabricated branches.
+- The NRRD must include an explicit RAS/LPS-family space, origin, and three orthogonal voxel directions. Sheared or unknown-space geometry is rejected.
+- Voxel spacing and axis orientation are converted to physical RAS millimetres for skeleton analysis and voxel assignment.
+- If `--ct` is supplied, it must be a 3D NIfTI with the same shape and voxel-to-world geometry as the input mask. The tool does not resample or copy a mismatched affine.
+- Without `--ct`, output geometry is converted from the input NRRD and retained in RAS millimetres.
+
+This repository labels an existing airway mask; it does not run TotalSegmentator. The output is a research result and still requires visual review in 3D Slicer. Geometry checks do not establish anatomical labeling accuracy or clinical suitability.
+
+### Parsing modes and regression fix
+
+- `ANATOMICAL_CANDIDATES`: the observed tree satisfies the naming heuristics. Anatomical names remain unvalidated candidates.
+- `TOPOLOGY_ONLY`: the tree is partial, disconnected, cyclic, or otherwise insufficient for the naming rules. Observed skeleton paths receive neutral names such as `Topology_Branch_001`. Console diagnostics explain why anatomical naming was unresolved.
+- Add `--strict-anatomy` to reject unresolved anatomical naming instead of using neutral paths. Unknown internal errors still fail; they are not converted into neutral results.
+
+The parser now follows the most superior endpoint to the first junction and excludes that proximal tracheal limb when selecting the main bronchi. Immediate junctions are retained, and anatomical directions use RAS instead of unstable PCA signs. A skeleton without branching is retried at a 10 mm TEASAR constant after the initial 50 mm attempt. Smaller constants that produced false terminal spurs in a straight-tube regression are not used.
+
+No mode fills missing airways, connects gaps, or changes the source mask. Disconnected components are retained for neutral parsing. Branch voxel assignment uses physical distances and preserves the selected foreground union.
+
+### Reproducing the Windows environment
+
+The tested environment is Windows with Python **3.12.10**. `requirements-lock.txt` records the complete installed package set, including Kimimaro **5.8.5**. In a separate Python 3.12 environment:
+
+```powershell
+python -m pip install -r requirements-lock.txt
+python -m unittest discover -s tests -v
+```
+
+The five graph regressions cover proximal-limb exclusion, immediate junctions, explicit neutral fallback, fixed RAS directions, and tracheal root traversal. These tests establish implementation behavior, not anatomical accuracy.
 
 ## 📄 License
 

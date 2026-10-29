@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+diagnostics/
+*.log
+
+# Local medical images and scene exports are not source code.
+*.raw
+*.raw.gz
+*.nrrd
+*.nii
+*.nii.gz
+*.mrb
+*.mrml
+*.dcm

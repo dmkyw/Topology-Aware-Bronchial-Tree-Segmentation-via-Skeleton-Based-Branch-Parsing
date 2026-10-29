@@ -33,6 +33,7 @@ Notes
 from __future__ import annotations
 
 import argparse
+import colorsys
 from collections import deque
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -42,7 +43,6 @@ import nibabel as nib
 import nrrd
 import numpy as np
 from scipy.spatial import cKDTree
-from sklearn.decomposition import PCA
 
 
 # bid -> (anatomical name, RGB color for Slicer)
@@ -96,11 +96,48 @@ DEFAULT_EXPORT_BIDS = [
 ]
 
 
+class TopologyStructureError(RuntimeError):
+    """An explicit limitation of the observed skeleton, not an internal crash."""
+
+    def __init__(self, code: str, message: str, diagnostics=None):
+        super().__init__(message)
+        self.code = code
+        self.diagnostics = diagnostics or {}
+
+
+def branch_color(bid: int) -> Tuple[float, float, float]:
+    if bid in LABELS:
+        return LABELS[bid][1]
+    return colorsys.hsv_to_rgb(((bid - 1000) * 0.61803398875) % 1.0, 0.75, 0.95)
+
+
 class BronchialBranchLabeler:
-    def __init__(self, mask: np.ndarray, ap_sign: float = 1.0, min_subtree_size: int = 5):
+    def __init__(
+        self,
+        mask: np.ndarray,
+        ap_sign: float = 1.0,
+        min_subtree_size: int = 5,
+        voxel_directions_ras_mm: Optional[np.ndarray] = None,
+        strict_anatomy: bool = False,
+    ):
         self.mask = mask.astype(bool)
         self.ap_sign = float(ap_sign)
         self.min_subtree_size = int(min_subtree_size)
+        self.strict_anatomy = bool(strict_anatomy)
+        self.parsing_mode = "NOT_PARSED"
+        self.diagnostics = {"algorithm": "rooted-ras-topology/2", "skeleton_attempts": []}
+        self.voxel_directions_ras_mm = np.asarray(
+            voxel_directions_ras_mm if voxel_directions_ras_mm is not None else np.eye(3),
+            dtype=float,
+        )
+        if self.voxel_directions_ras_mm.shape != (3, 3) or not np.isfinite(self.voxel_directions_ras_mm).all():
+            raise ValueError("Voxel geometry must contain three finite spatial axes.")
+        self.voxel_spacing_mm = np.linalg.norm(self.voxel_directions_ras_mm, axis=1)
+        if np.any(self.voxel_spacing_mm <= 0):
+            raise ValueError("Voxel geometry must contain three finite, nonzero spatial axes.")
+        self.voxel_axis_directions_ras = (
+            self.voxel_directions_ras_mm / self.voxel_spacing_mm[:, None]
+        )
 
         self.verts: np.ndarray
         self.edges: np.ndarray
@@ -115,29 +152,71 @@ class BronchialBranchLabeler:
     def run(self) -> Dict[int, Set[int]]:
         self._skeletonize()
         self._build_graph()
+        # A 50 mm TEASAR invalidation radius can suppress short, existing limbs.
+        # Retry the skeleton only; the mask is never filled or altered.
+        for const_mm in (10.0,):
+            if np.any(self.degree >= 3):
+                break
+            self._skeletonize(const_mm=const_mm)
+            self._build_graph()
         self._estimate_axes()
-        self._find_carina()
-        return self._discover_segments()
+        self.diagnostics.update({"skeleton_vertices": len(self.verts),
+                                 "skeleton_edges": len(self.edges),
+                                 "branch_points": int(np.count_nonzero(self.degree >= 3)),
+                                 "connected_components": self.graph_components})
+        if not np.any(self.degree >= 3):
+            raise TopologyStructureError("NO_BRANCH_POINTS", "No graph branching point was found after skeleton scale retries. No anatomical branches were invented.", self.diagnostics)
+        try:
+            if self.graph_components != 1 or len(self.edges) != len(self.verts)-1:
+                raise TopologyStructureError("NON_TREE_SKELETON", "The observed skeleton is disconnected or cyclic; anatomical naming is unresolved.")
+            self._find_carina()
+            segments = self._discover_segments()
+        except TopologyStructureError as error:
+            self.diagnostics.update({"anatomy_unresolved_code": error.code,
+                                     "anatomy_unresolved_reason": str(error)})
+            if self.strict_anatomy:
+                raise
+            self.parsing_mode = "TOPOLOGY_ONLY"
+            segments = self._topological_segments()
+        else:
+            self.parsing_mode = "ANATOMICAL_CANDIDATES"
+        self.diagnostics["parsing_mode"] = self.parsing_mode
+        return segments
 
-    def _skeletonize(self) -> None:
+    def export_items(self, segment_nodes: Dict[int, Set[int]]) -> List[Tuple[int, str]]:
+        if self.parsing_mode == "TOPOLOGY_ONLY":
+            return [(bid, f"Topology_Branch_{i:03d}")
+                    for i, bid in enumerate(sorted(segment_nodes), 1)]
+        return build_export_items(segment_nodes, DEFAULT_EXPORT_BIDS)
+
+    def _skeletonize(self, const_mm: float = 50.0) -> None:
         skeletons = kimimaro.skeletonize(
             self.mask.astype(np.uint8),
             teasar_params={
                 "scale": 1.0,
-                "const": 50,
+                "const": const_mm,
                 "pdrf_exponent": 4,
                 "pdrf_scale": 100000,
             },
-            dust_threshold=10,
-            anisotropy=(1, 1, 1),
+            dust_threshold=0,
+            anisotropy=tuple(float(v) for v in self.voxel_spacing_mm),
             fix_branching=True,
             fix_borders=True,
         )
         if not skeletons:
-            raise RuntimeError("No skeleton was generated. Please check the input airway mask.")
-        main = max(skeletons.values(), key=lambda skel: skel.vertices.shape[0])
-        self.verts = main.vertices.astype(np.float32)
-        self.edges = main.edges.astype(np.int64)
+            raise TopologyStructureError("EMPTY_SKELETON", "No skeleton was generated. Please check the input airway mask.")
+        # Kimimaro returns vertices in physical units along the array axes.
+        # Rotate/reflect those axes into RAS so anatomical heuristics and voxel
+        # assignment use the same physical coordinate system.
+        vertices, edges, offset = [], [], 0
+        for skeleton in skeletons.values():
+            vertices.append(skeleton.vertices.astype(np.float64) @ self.voxel_axis_directions_ras)
+            edges.append(skeleton.edges.astype(np.int64).reshape(-1, 2) + offset)
+            offset += len(skeleton.vertices)
+        self.verts = np.concatenate(vertices)
+        self.edges = np.concatenate(edges).reshape(-1, 2)
+        self.diagnostics["skeleton_attempts"].append({"const_mm": const_mm,
+            "vertices": len(self.verts), "components": len(skeletons)})
 
     def _build_graph(self) -> None:
         self.adj = [[] for _ in range(len(self.verts))]
@@ -145,18 +224,90 @@ class BronchialBranchLabeler:
             self.adj[int(a)].append(int(b))
             self.adj[int(b)].append(int(a))
         self.degree = np.array([len(nbs) for nbs in self.adj])
+        remaining = set(range(len(self.verts)))
+        self.graph_components = 0
+        while remaining:
+            stack = [min(remaining)]
+            self.graph_components += 1
+            while stack:
+                node = stack.pop()
+                if node in remaining:
+                    remaining.remove(node)
+                    stack.extend(self.adj[node])
 
     def _estimate_axes(self) -> None:
-        pca = PCA(n_components=3).fit(self.verts)
-        self.pc1, self.pc2, self.pc3 = pca.components_
+        # Vertices are already physical RAS. PCA signs/order are not anatomical
+        # axes and change when branches are added, cropped, or reflected.
+        self.pc1 = np.array([0.0, 0.0, 1.0])  # superior
+        self.pc2 = np.array([1.0, 0.0, 0.0])  # right
+        self.pc3 = np.array([0.0, 1.0, 0.0])  # anterior
 
     def _find_carina(self) -> None:
         branch_idx = np.where(self.degree >= 3)[0]
         if len(branch_idx) == 0:
-            raise RuntimeError("No graph branching point was found.")
-        xy_center = self.verts[:, :2].mean(axis=0)
-        self.carina = int(branch_idx[np.argmin(np.linalg.norm(self.verts[branch_idx, :2] - xy_center, axis=1))])
-        self.dist = self.bfs_distance(self.carina)
+            raise TopologyStructureError("NO_BRANCH_POINTS",
+                "No graph branching point was found in the airway mask. "
+                "Provide the complete bifurcating tracheobronchial tree; an isolated airway segment or "
+                "single centerline cannot be parsed into anatomical branches. No output was written."
+            )
+        endpoints = np.flatnonzero(self.degree == 1)
+        if not len(endpoints):
+            raise TopologyStructureError("NO_TRACHEAL_ENDPOINT", "No terminal tracheal candidate is available.")
+        self.trachea_root = int(max(endpoints, key=lambda n: (self.verts[n, 2], -abs(self.verts[n, 0]))))
+        path, previous, current = [], -1, self.trachea_root
+        while current not in path:
+            path.append(current)
+            children = [n for n in self.adj[current] if n != previous]
+            if len(children) >= 2:
+                self.carina = current
+                self._trachea_path = path
+                self.dist = self.bfs_distance(self.carina)
+                self.diagnostics.update({"root_method": "superior_endpoint_to_first_junction",
+                    "trachea_root": self.trachea_root, "carina": self.carina})
+                return
+            if not children:
+                break
+            previous, current = current, children[0]
+        raise TopologyStructureError("CARINA_UNRESOLVED", "The tracheal candidate does not reach a branching point.")
+
+    def _select_main_neighbors(self) -> Tuple[int, int]:
+        parent = self._trachea_path[-2]
+        children = [n for n in self.adj[self.carina] if n != parent]
+        if len(children) < 2:
+            raise TopologyStructureError("MAIN_BRANCHES_UNRESOLVED", "Two distal bronchial limbs were not observed.")
+        # Rank actual distal subtrees, excluding the known proximal limb.
+        # The old minimum-angle rule frequently selected the trachea instead.
+        sizes = {n: len(self.trace_component(n, blocked={self.carina})) for n in children}
+        return max(((a,b) for i,a in enumerate(children) for b in children[i+1:]),
+                   key=lambda pair: (min(sizes[pair[0]], sizes[pair[1]]),
+                                     sizes[pair[0]]+sizes[pair[1]], -min(pair)))
+
+    def _topological_segments(self) -> Dict[int, Set[int]]:
+        """Partition observed graph paths without assigning anatomical names."""
+        visited, paths = set(), []
+        key = lambda n: (-float(self.verts[n,2]), float(self.verts[n,0]), float(self.verts[n,1]), n)
+        critical = sorted(np.flatnonzero(self.degree != 2).tolist(), key=key)
+        for start in critical + sorted(np.flatnonzero(self.degree == 2).tolist(), key=key):
+            if self.degree[start] == 0:
+                paths.append([start])
+            for neighbor in sorted(self.adj[start], key=key):
+                edge = tuple(sorted((start,neighbor)))
+                if edge in visited:
+                    continue
+                path, previous, current = [start], start, neighbor
+                visited.add(edge)
+                while True:
+                    path.append(current)
+                    if self.degree[current] != 2:
+                        break
+                    following = next(n for n in self.adj[current] if n != previous)
+                    edge = tuple(sorted((current,following)))
+                    if edge in visited:
+                        break
+                    visited.add(edge)
+                    previous, current = current, following
+                paths.append(path)
+        return {1000+i: set(path) for i,path in enumerate(paths)}
 
     def unit_vec(self, a: int, b: int) -> np.ndarray:
         v = self.verts[a] - self.verts[b]
@@ -207,13 +358,7 @@ class BronchialBranchLabeler:
             cur, prev = max(nxts, key=lambda x: self.dist[x]), cur
 
     def first_branch(self, node: int, parent: int) -> Optional[int]:
-        candidates = [
-            self.trace_until_branch(n, node)
-            for n in self.adj[node]
-            if n != parent and self.dist[n] > self.dist[node]
-        ]
-        candidates = [c for c in candidates if c is not None]
-        return min(candidates, key=lambda x: self.dist[x]) if candidates else None
+        return self.trace_until_branch(node, parent)
 
     def branch_children(self, node: int, parent: int) -> List[int]:
         return list({
@@ -307,26 +452,7 @@ class BronchialBranchLabeler:
         return out
 
     def trace_trachea(self) -> List[int]:
-        path = [self.carina]
-        current, prev = self.carina, None
-        while True:
-            neighbors = self.adj[current]
-            if prev is not None:
-                neighbors = [n for n in neighbors if n != prev]
-            if not neighbors:
-                break
-
-            best, best_score = None, -1e9
-            for n in neighbors:
-                vec = self.unit_vec(n, current)
-                score = float(np.dot(vec, self.pc1))
-                if score > best_score:
-                    best_score, best = score, n
-            if best is None or best_score < 0.15:
-                break
-            path.append(best)
-            prev, current = current, best
-        return path
+        return list(reversed(self._trachea_path))
 
     def classify_b123(self, root_node: int, parent_node: int, side_prefix: str) -> Dict[str, Set[int]]:
         infos = self.distal_subtrees(root_node, parent_node, keep=3)
@@ -534,17 +660,15 @@ class BronchialBranchLabeler:
             node_map[f"{side_prefix}_B9+B10"] = territory_info["nodes"]
 
     def _discover_segments(self) -> Dict[int, Set[int]]:
-        neighbors = self.adj[self.carina]
-        dirs = [self.unit_vec(n, self.carina) for n in neighbors]
-        l2_a, l2_b, _ = min(
-            ((neighbors[i], neighbors[j], float(np.dot(dirs[i], dirs[j])))
-             for i in range(len(neighbors)) for j in range(i + 1, len(neighbors))),
-            key=lambda x: x[2],
-        )
+        l2_a, l2_b = self._select_main_neighbors()
 
         l3_a, l3_b = self.first_branch(l2_a, self.carina), self.first_branch(l2_b, self.carina)
         if l3_a is None or l3_b is None:
-            raise RuntimeError("Failed to identify main bronchial branching nodes.")
+            raise TopologyStructureError("MAIN_BRANCHES_UNRESOLVED", "Main bronchial branching nodes are unresolved in the observed skeleton.")
+
+        lateral = self.verts[[l3_a, l3_b], 0] - self.verts[self.carina, 0]
+        if min(lateral) >= -1e-6 or max(lateral) <= 1e-6:
+            raise TopologyStructureError("LEFT_RIGHT_UNRESOLVED", "The observed proximal limbs do not establish distinct left/right territories in RAS.")
 
         if np.dot(self.verts[l3_a] - self.verts[self.carina], self.pc2) < np.dot(self.verts[l3_b] - self.verts[self.carina], self.pc2):
             lmb_l3, rmb_l3, lmb_l2, rmb_l2 = l3_a, l3_b, l2_a, l2_b
@@ -554,13 +678,12 @@ class BronchialBranchLabeler:
         raw_lul, raw_lll = self.split_by_up(self.branch_children(lmb_l3, lmb_l2), lmb_l3)
         raw_rul, raw_bi = self.split_by_up(self.branch_children(rmb_l3, rmb_l2), rmb_l3)
 
-        # Semantic swap retained from the validated working version.
-        lmb_node, rmb_node = rmb_l3, lmb_l3
-        rul_node, bi_node = raw_lul, raw_lll
-        lul_node, lll_node = raw_rul, raw_bi
+        lmb_node, rmb_node = lmb_l3, rmb_l3
+        rul_node, bi_node = raw_rul, raw_bi
+        lul_node, lll_node = raw_lul, raw_lll
 
         if None in [rul_node, bi_node, lul_node, lll_node]:
-            raise RuntimeError("Failed to identify lobar bronchial nodes.")
+            raise TopologyStructureError("LOBAR_BRANCHES_UNRESOLVED", "Lobar branching nodes are not all observed; use neutral topology labels.")
 
         rul_map = self.classify_b123(rul_node, rmb_node, "Rt")
         rml, rll = self.split_by_up(self.branch_children(bi_node, rmb_node), bi_node)
@@ -619,7 +742,154 @@ class BronchialBranchLabeler:
 
 def load_airway_mask(input_path: Path, airway_value: int = 1) -> Tuple[np.ndarray, dict]:
     data, header = nrrd.read(str(input_path))
-    return data == airway_value, header
+    if data.ndim != 3:
+        raise ValueError(
+            f"Expected one 3D airway labelmap, got shape {data.shape}. "
+            "Extract a single 3D mask from multi-layer/4D Slicer segmentations first."
+        )
+    if not np.issubdtype(data.dtype, np.number) and data.dtype != np.bool_:
+        raise ValueError(f"Airway labelmap must be numeric or boolean, got {data.dtype}.")
+    if not np.isfinite(data).all():
+        raise ValueError("Airway labelmap contains non-finite voxel values.")
+    mask = data == airway_value
+    if not mask.any():
+        raise ValueError(f"No airway voxels equal to --airway-value {airway_value} were found.")
+    return mask, header
+
+
+def _unit_scale_to_mm(unit: str) -> float:
+    unit = unit.strip().lower()
+    scales = {
+        "mm": 1.0,
+        "millimeter": 1.0,
+        "millimeters": 1.0,
+        "millimetre": 1.0,
+        "millimetres": 1.0,
+        "cm": 10.0,
+        "centimeter": 10.0,
+        "centimeters": 10.0,
+        "centimetre": 10.0,
+        "centimetres": 10.0,
+        "m": 1000.0,
+        "meter": 1000.0,
+        "meters": 1000.0,
+        "metre": 1000.0,
+        "metres": 1000.0,
+        "um": 0.001,
+        "µm": 0.001,
+        "micron": 0.001,
+        "microns": 0.001,
+        "micrometer": 0.001,
+        "micrometers": 0.001,
+        "micrometre": 0.001,
+        "micrometres": 0.001,
+    }
+    try:
+        return scales[unit]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported or unknown spatial unit {unit!r}; use a length unit.") from exc
+
+
+def _validate_orthogonal_axes(axis_vectors: np.ndarray, description: str) -> None:
+    if axis_vectors.shape != (3, 3):
+        raise ValueError(f"{description} must contain exactly three spatial axes.")
+    lengths = np.linalg.norm(axis_vectors, axis=1)
+    if not np.isfinite(axis_vectors).all() or np.any(lengths <= 0):
+        raise ValueError(f"{description} has invalid or zero-length spatial axes.")
+    unit_vectors = axis_vectors / lengths[:, None]
+    if not np.allclose(unit_vectors @ unit_vectors.T, np.eye(3), atol=1e-4, rtol=0):
+        raise ValueError(
+            f"{description} contains non-orthogonal/sheared axes, which this workflow does not support."
+        )
+
+
+def nrrd_geometry_ras_mm(header: dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Return NRRD origin and per-array-axis vectors in RAS millimetres."""
+    space_signs = {
+        "right-anterior-superior": np.array([1.0, 1.0, 1.0]),
+        "left-posterior-superior": np.array([-1.0, -1.0, 1.0]),
+        "left-anterior-superior": np.array([-1.0, 1.0, 1.0]),
+        "right-posterior-superior": np.array([1.0, -1.0, 1.0]),
+    }
+    space = str(header.get("space", "")).strip().lower()
+    if space not in space_signs:
+        raise ValueError(
+            f"Unsupported or missing NRRD space {space!r}; expected an explicit RAS/LPS-family space."
+        )
+    try:
+        directions = np.asarray(header["space directions"], dtype=float)
+        origin = np.asarray(header["space origin"], dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Input NRRD must include 3D space directions and a space origin.") from exc
+    if directions.shape != (3, 3) or origin.shape != (3,):
+        raise ValueError("Input NRRD must have exactly three spatial directions and a 3D origin.")
+
+    units = header.get("space units")
+    # NRRD commonly omits space units for medical volumes; the pipeline's
+    # coordinate contract is millimetres in that case.
+    if units is None:
+        scale = 1.0
+    else:
+        units = list(units)
+        if len(units) != 3:
+            raise ValueError("Input NRRD space units must contain three entries.")
+        unit_scales = np.array([_unit_scale_to_mm(str(unit).strip('"')) for unit in units])
+        if not np.allclose(unit_scales, unit_scales[0], atol=0, rtol=0):
+            raise ValueError("Mixed spatial units across NRRD axes are not supported.")
+        scale = float(unit_scales[0])
+
+    signs = space_signs[space]
+    origin_ras_mm = origin * signs * scale
+    directions_ras_mm = directions * signs[None, :] * scale
+    _validate_orthogonal_axes(directions_ras_mm, "Input NRRD geometry")
+    return origin_ras_mm, directions_ras_mm
+
+
+def validate_ct_geometry(
+    mask_shape: Sequence[int],
+    input_header: dict,
+    ct_path: Optional[Path],
+) -> Optional[np.ndarray]:
+    """Validate exact input-mask/CT voxel correspondence; never resample silently."""
+    source_origin_ras_mm, source_directions_ras_mm = nrrd_geometry_ras_mm(input_header)
+    if ct_path is None:
+        return None
+
+    ct_img = nib.load(str(ct_path))
+    if len(ct_img.shape) != 3:
+        raise ValueError(f"Reference CT must be a 3D NIfTI volume, got shape {ct_img.shape}.")
+    if tuple(ct_img.shape) != tuple(mask_shape):
+        raise ValueError(
+            f"Input mask shape {tuple(mask_shape)} does not match CT shape {tuple(ct_img.shape)}; "
+            "resampling is not performed."
+        )
+    spatial_unit = ct_img.header.get_xyzt_units()[0]
+    ct_scale = _unit_scale_to_mm(spatial_unit) if spatial_unit else None
+    if ct_scale is None:
+        raise ValueError("Reference CT must declare its spatial units; unknown units cannot be matched safely.")
+
+    affine_ras_mm = np.asarray(ct_img.affine, dtype=float).copy()
+    if affine_ras_mm.shape != (4, 4) or not np.isfinite(affine_ras_mm).all():
+        raise ValueError("Reference CT has an invalid voxel-to-world affine.")
+    affine_ras_mm[:3, :] *= ct_scale
+    ct_directions_ras_mm = affine_ras_mm[:3, :3].T
+    _validate_orthogonal_axes(ct_directions_ras_mm, "Reference CT geometry")
+    if not np.allclose(
+        source_directions_ras_mm,
+        ct_directions_ras_mm,
+        atol=1e-3,
+        rtol=1e-5,
+    ) or not np.allclose(
+        source_origin_ras_mm,
+        affine_ras_mm[:3, 3],
+        atol=1e-3,
+        rtol=1e-5,
+    ):
+        raise ValueError(
+            "Input mask and CT do not share the same RAS voxel geometry; "
+            "the tool will not copy CT geometry onto a differently aligned mask."
+        )
+    return affine_ras_mm
 
 
 def build_export_items(segment_nodes: Dict[int, Set[int]], export_bids: Sequence[int]) -> List[Tuple[int, str]]:
@@ -631,8 +901,11 @@ def assign_voxel_labels(
     verts: np.ndarray,
     segment_nodes: Dict[int, Set[int]],
     export_items: Sequence[Tuple[int, str]],
+    voxel_directions_ras_mm: np.ndarray,
 ) -> np.ndarray:
     all_pts, all_lbl = [], []
+    if len(export_items) > np.iinfo(np.uint16).max:
+        raise ValueError("Too many observed branches for a uint16 labelmap.")
     for export_label, (bid, _) in enumerate(export_items, start=1):
         pts = verts[list(segment_nodes[bid])]
         all_pts.append(pts)
@@ -641,11 +914,15 @@ def assign_voxel_labels(
     if not all_pts:
         raise RuntimeError("No valid segment nodes are available for export.")
 
-    tree = cKDTree(np.vstack(all_pts))
-    labels = np.concatenate(all_lbl)
+    points, first = np.unique(np.vstack(all_pts), axis=0, return_index=True)
+    # Shared junction nodes go to the first exported segment, deterministically.
+    # Lexicographic physical coordinates also stabilize equal-distance queries.
+    tree = cKDTree(points)
+    labels = np.concatenate(all_lbl)[first]
     voxels = np.argwhere(mask)
     labelmap = np.zeros(mask.shape, dtype=np.uint16)
-    _, nearest = tree.query(voxels, k=1)
+    voxels_ras_mm = voxels @ voxel_directions_ras_mm
+    _, nearest = tree.query(voxels_ras_mm, k=1)
     labelmap[tuple(voxels.T)] = labels[nearest]
     return labelmap
 
@@ -653,7 +930,7 @@ def assign_voxel_labels(
 def make_slicer_segmentation(
     labelmap: np.ndarray,
     export_items: Sequence[Tuple[int, str]],
-    ct_path: Optional[Path] = None,
+    ct_affine_ras_mm: Optional[np.ndarray] = None,
     fallback_header: Optional[dict] = None,
 ) -> Tuple[np.ndarray, dict, List[Tuple[int, str]]]:
     segment_arrays = []
@@ -677,11 +954,11 @@ def make_slicer_segmentation(
         "encoding": "gzip",
         "Segmentation_MasterRepresentation": "Binary labelmap",
         "Segmentation_ContainedRepresentationNames": "Binary labelmap",
+        "space units": ["mm", "mm", "mm"],
     }
 
-    if ct_path is not None:
-        ct_img = nib.load(str(ct_path))
-        affine = ct_img.affine
+    if ct_affine_ras_mm is not None:
+        affine = ct_affine_ras_mm
         header["space"] = "right-anterior-superior"
         header["space origin"] = affine[:3, 3].astype(float)
         header["space directions"] = np.vstack([
@@ -691,12 +968,15 @@ def make_slicer_segmentation(
             affine[:3, 2],
         ]).astype(float)
     elif fallback_header is not None:
-        for key in ("space", "space origin", "space directions", "measurement frame"):
-            if key in fallback_header:
-                header[key] = fallback_header[key]
+        origin_ras_mm, directions_ras_mm = nrrd_geometry_ras_mm(fallback_header)
+        header["space"] = "right-anterior-superior"
+        header["space origin"] = origin_ras_mm
+        header["space directions"] = np.vstack(
+            (np.full((1, 3), np.nan), directions_ras_mm)
+        )
 
     for i, (bid, name) in enumerate(segment_meta):
-        color = LABELS[bid][1]
+        color = branch_color(bid)
         nz = np.argwhere(segment_arrays[i] > 0)
         xmin, ymin, zmin = nz.min(axis=0)
         xmax, ymax, zmax = nz.max(axis=0)
@@ -737,6 +1017,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--airway-value", type=int, default=1, help="Voxel value of the airway mask. Default: 1.")
     parser.add_argument("--ap-sign", type=float, default=1.0, choices=[-1.0, 1.0], help="Use -1 if AP assignment is reversed.")
     parser.add_argument("--min-subtree-size", type=int, default=5, help="Minimum skeleton component size for branch classification.")
+    parser.add_argument("--strict-anatomy", action="store_true", help="Fail instead of exporting neutral topology when anatomical naming is unresolved.")
     return parser.parse_args()
 
 
@@ -748,15 +1029,40 @@ def main() -> None:
     print("The entire process may take around 2-3 minutes depending on the airway complexity and hardware. Please wait until completion.")
 
     mask, input_header = load_airway_mask(input_path, airway_value=args.airway_value)
-    labeler = BronchialBranchLabeler(mask, ap_sign=args.ap_sign, min_subtree_size=args.min_subtree_size)
-    segment_nodes = labeler.run()
+    _, voxel_directions_ras_mm = nrrd_geometry_ras_mm(input_header)
+    ct_affine_ras_mm = validate_ct_geometry(mask.shape, input_header, args.ct)
 
-    export_items = build_export_items(segment_nodes, DEFAULT_EXPORT_BIDS)
-    labelmap = assign_voxel_labels(mask, labeler.verts, segment_nodes, export_items)
+    protected_inputs = {input_path.resolve()}
+    if args.ct is not None:
+        protected_inputs.add(args.ct.resolve())
+    resolved_outputs = {output_path.resolve(), txt_path.resolve()}
+    if len(resolved_outputs) != 2 or resolved_outputs & protected_inputs:
+        raise ValueError("Output paths must be distinct from each other, the input mask, and the reference CT.")
+
+    labeler = BronchialBranchLabeler(
+        mask,
+        ap_sign=args.ap_sign,
+        min_subtree_size=args.min_subtree_size,
+        voxel_directions_ras_mm=voxel_directions_ras_mm,
+        strict_anatomy=args.strict_anatomy,
+    )
+    segment_nodes = labeler.run()
+    print("Parsing mode:", labeler.parsing_mode)
+    if labeler.parsing_mode == "TOPOLOGY_ONLY":
+        print("Anatomical naming unresolved:", labeler.diagnostics.get("anatomy_unresolved_reason", ""))
+
+    export_items = labeler.export_items(segment_nodes)
+    labelmap = assign_voxel_labels(
+        mask,
+        labeler.verts,
+        segment_nodes,
+        export_items,
+        voxel_directions_ras_mm,
+    )
     seg_data, header, segment_meta = make_slicer_segmentation(
         labelmap,
         export_items,
-        ct_path=args.ct,
+        ct_affine_ras_mm=ct_affine_ras_mm,
         fallback_header=input_header,
     )
 
