@@ -146,7 +146,7 @@ This repository labels an existing airway mask; it does not run TotalSegmentator
 - `TOPOLOGY_ONLY`: the tree is partial, disconnected, cyclic, or otherwise insufficient for the naming rules. Observed skeleton paths receive neutral names such as `Topology_Branch_001`. Console diagnostics explain why anatomical naming was unresolved.
 - Add `--strict-anatomy` to reject unresolved anatomical naming instead of using neutral paths. Unknown internal errors still fail; they are not converted into neutral results.
 
-The parser now follows the most superior endpoint to the first junction and excludes that proximal tracheal limb when selecting the main bronchi. Immediate junctions are retained, and anatomical directions use RAS instead of unstable PCA signs. A skeleton without branching is retried at a 10 mm TEASAR constant after the initial 50 mm attempt. Smaller constants that produced false terminal spurs in a straight-tube regression are not used.
+The parser now follows the most superior endpoint to the first junction and excludes that proximal tracheal limb when selecting the main bronchi. Immediate junctions are retained, and anatomical directions use RAS instead of unstable PCA signs. It evaluates TEASAR constants of 50, 25, then 10 mm, stopping at the first skeleton that supports the naming rules. This catches trees where a coarse skeleton has junctions but prunes shorter lobar branches. If naming remains unresolved, the 10 mm skeleton is exported with neutral names and scale-by-scale diagnostics. A straight-tube regression ensures finer scales do not invent branches where no graph junction is present. Smaller constants that produced false terminal spurs are not used.
 
 No mode fills missing airways, connects gaps, or changes the source mask. Disconnected components are retained for neutral parsing. Branch voxel assignment uses physical distances and preserves the selected foreground union.
 
@@ -159,7 +159,7 @@ python -m pip install -r requirements-lock.txt
 python -m unittest discover -s tests -v
 ```
 
-The five graph regressions cover proximal-limb exclusion, immediate junctions, explicit neutral fallback, fixed RAS directions, and tracheal root traversal. These tests establish implementation behavior, not anatomical accuracy.
+The graph regressions cover proximal-limb exclusion, immediate junctions, neutral fallback, fixed RAS directions, tracheal root traversal, refinement after structured anatomy limitations, propagation of unexpected errors, and no-branch failure after all scales. These tests establish implementation behavior, not anatomical accuracy.
 
 ## 📄 License
 

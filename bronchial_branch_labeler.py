@@ -150,38 +150,67 @@ class BronchialBranchLabeler:
         self.carina: int
 
     def run(self) -> Dict[int, Set[int]]:
-        self._skeletonize()
-        self._build_graph()
-        # A 50 mm TEASAR invalidation radius can suppress short, existing limbs.
-        # Retry the skeleton only; the mask is never filled or altered.
-        for const_mm in (10.0,):
-            if np.any(self.degree >= 3):
-                break
+        unresolved = None
+        self.diagnostics["anatomy_attempts"] = []
+        # A coarse TEASAR scale can preserve a plausible tree while pruning the
+        # short lobar branches needed by the naming rules. Try progressively
+        # finer centerlines and stop at the first scale that supports naming.
+        # The mask itself is never filled, connected, or otherwise changed.
+        for const_mm in (50.0, 25.0, 10.0):
             self._skeletonize(const_mm=const_mm)
             self._build_graph()
-        self._estimate_axes()
-        self.diagnostics.update({"skeleton_vertices": len(self.verts),
-                                 "skeleton_edges": len(self.edges),
-                                 "branch_points": int(np.count_nonzero(self.degree >= 3)),
-                                 "connected_components": self.graph_components})
-        if not np.any(self.degree >= 3):
-            raise TopologyStructureError("NO_BRANCH_POINTS", "No graph branching point was found after skeleton scale retries. No anatomical branches were invented.", self.diagnostics)
-        try:
-            if self.graph_components != 1 or len(self.edges) != len(self.verts)-1:
-                raise TopologyStructureError("NON_TREE_SKELETON", "The observed skeleton is disconnected or cyclic; anatomical naming is unresolved.")
-            self._find_carina()
-            segments = self._discover_segments()
-        except TopologyStructureError as error:
-            self.diagnostics.update({"anatomy_unresolved_code": error.code,
-                                     "anatomy_unresolved_reason": str(error)})
-            if self.strict_anatomy:
-                raise
-            self.parsing_mode = "TOPOLOGY_ONLY"
-            segments = self._topological_segments()
-        else:
+            self._estimate_axes()
+            self.diagnostics.update({"skeleton_vertices": len(self.verts),
+                                     "skeleton_edges": len(self.edges),
+                                     "branch_points": int(np.count_nonzero(self.degree >= 3)),
+                                     "connected_components": self.graph_components})
+            if not np.any(self.degree >= 3):
+                unresolved = TopologyStructureError(
+                    "NO_BRANCH_POINTS", "No graph branching point was found at this skeleton scale."
+                )
+                self.diagnostics["anatomy_attempts"].append({
+                    "const_mm": const_mm, "code": unresolved.code, "reason": str(unresolved),
+                })
+                continue
+            try:
+                if self.graph_components != 1 or len(self.edges) != len(self.verts)-1:
+                    raise TopologyStructureError(
+                        "NON_TREE_SKELETON",
+                        "The observed skeleton is disconnected or cyclic; anatomical naming is unresolved.",
+                    )
+                self._find_carina()
+                segments = self._discover_segments()
+            except TopologyStructureError as error:
+                unresolved = error
+                self.diagnostics["anatomy_attempts"].append({
+                    "const_mm": const_mm, "code": error.code, "reason": str(error),
+                })
+                continue
             self.parsing_mode = "ANATOMICAL_CANDIDATES"
+            self.diagnostics["anatomy_attempts"].append({
+                "const_mm": const_mm, "status": self.parsing_mode,
+            })
+            self.diagnostics["selected_skeleton_const_mm"] = const_mm
+            self.diagnostics["parsing_mode"] = self.parsing_mode
+            return segments
+
+        if not np.any(self.degree >= 3):
+            unresolved = TopologyStructureError(
+                "NO_BRANCH_POINTS",
+                "No graph branching point was found after trying 50, 25, and 10 mm skeleton scales. No anatomical branches were invented.",
+                self.diagnostics,
+            )
+            raise unresolved
+        if unresolved is None:
+            raise RuntimeError("Topology parsing ended without a result or a structured limitation.")
+        self.diagnostics.update({"anatomy_unresolved_code": unresolved.code,
+                                 "anatomy_unresolved_reason": str(unresolved),
+                                 "selected_skeleton_const_mm": 10.0})
+        if self.strict_anatomy:
+            raise TopologyStructureError(unresolved.code, str(unresolved), self.diagnostics)
+        self.parsing_mode = "TOPOLOGY_ONLY"
         self.diagnostics["parsing_mode"] = self.parsing_mode
-        return segments
+        return self._topological_segments()
 
     def export_items(self, segment_nodes: Dict[int, Set[int]]) -> List[Tuple[int, str]]:
         if self.parsing_mode == "TOPOLOGY_ONLY":
