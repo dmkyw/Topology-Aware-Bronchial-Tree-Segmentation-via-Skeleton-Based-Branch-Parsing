@@ -3,7 +3,7 @@ Topology-aware bronchial tree segmentation from CT. Airway masks are extracted u
 
 # 🫁 Bronchial Branch Labeler
 
-Automatically parse an unsegmented bronchial tree into anatomically meaningful airway branches using skeleton-based topology analysis.
+Partition an observed airway skeleton by topology and, when configured anatomical heuristics pass, produce unvalidated anatomical-name candidates. The output still requires CT review; topology success does not establish anatomical completeness or naming accuracy.
 
 ---
 
@@ -142,11 +142,12 @@ This repository labels an existing airway mask; it does not run TotalSegmentator
 
 ### Parsing modes and regression fix
 
-- `ANATOMICAL_CANDIDATES`: the observed tree satisfies the naming heuristics. Anatomical names remain unvalidated candidates.
+- `ANATOMICAL_CANDIDATES`: the observed tree satisfies the naming heuristics. Anatomical names remain unvalidated candidates and must be checked against CT by a qualified reviewer.
 - `TOPOLOGY_ONLY`: the tree is partial, disconnected, cyclic, or otherwise insufficient for the naming rules. Observed skeleton paths receive neutral names such as `Topology_Branch_001`. Console diagnostics explain why anatomical naming was unresolved.
 - Add `--strict-anatomy` to reject unresolved anatomical naming instead of using neutral paths. Unknown internal errors still fail; they are not converted into neutral results.
 
 The parser now follows the most superior endpoint to the first junction and excludes that proximal tracheal limb when selecting the main bronchi. Immediate junctions are retained, and anatomical directions use RAS instead of unstable PCA signs. It evaluates TEASAR constants of 50, 25, then 10 mm, stopping at the first skeleton that supports the naming rules. This catches trees where a coarse skeleton has junctions but prunes shorter lobar branches. If naming remains unresolved, the 10 mm skeleton is exported with neutral names and scale-by-scale diagnostics. A straight-tube regression ensures finer scales do not invent branches where no graph junction is present. Smaller constants that produced false terminal spurs are not used.
+The right middle-lobe B4/B5 candidate split uses lateral/medial RAS direction; the left lingular B4/B5 split uses superior/inferior RAS direction. They are not sorted on one shared anterior-posterior axis. An ambiguous two-branch B1/B2/B3 pattern now fails anatomical classification and uses the neutral topology fallback. These geometry rules are candidate-generation heuristics, not validated anatomical thresholds.
 
 No mode fills missing airways, connects gaps, or changes the source mask. Disconnected components are retained for neutral parsing. Branch voxel assignment uses physical distances and preserves the selected foreground union.
 
@@ -159,7 +160,7 @@ python -m pip install -r requirements-lock.txt
 python -m unittest discover -s tests -v
 ```
 
-The graph regressions cover proximal-limb exclusion, immediate junctions, neutral fallback, fixed RAS directions, tracheal root traversal, refinement after structured anatomy limitations, propagation of unexpected errors, and no-branch failure after all scales. These tests establish implementation behavior, not anatomical accuracy.
+The graph regressions cover proximal-limb exclusion, immediate junctions, neutral fallback, fixed RAS directions, tracheal root traversal, refinement after structured anatomy limitations, propagation of unexpected errors, no-branch failure after all scales, right middle-lobe and left lingular B4/B5 axes, and ambiguous upper-lobe fallback. These tests establish implementation behavior, not anatomical accuracy.
 
 ## 📄 License
 

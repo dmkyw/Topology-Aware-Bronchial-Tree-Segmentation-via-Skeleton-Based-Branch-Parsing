@@ -510,7 +510,10 @@ class BronchialBranchLabeler:
             elif ap_sorted[1]["ap_score"] < -0.35 and ap_sorted[0]["ap_score"] - ap_sorted[1]["ap_score"] > 0.20:
                 assignment = {labels["B2"]: ap_sorted[1], labels["B13"]: ap_sorted[0]}
             else:
-                assignment = {labels["B1"]: up_sorted[0], labels["B23"]: up_sorted[1]}
+                raise TopologyStructureError(
+                    "UPPER_SEGMENT_LABELS_UNRESOLVED",
+                    f"{side_prefix} B1/B2/B3 directional pattern is ambiguous; retain neutral topology labels.",
+                )
         else:
             return {}
         return {label: info["nodes"] for label, info in assignment.items()}
@@ -518,8 +521,15 @@ class BronchialBranchLabeler:
     def classify_b45(self, root_node: int, parent_node: int, side_prefix: str) -> Dict[str, Set[int]]:
         infos = self.distal_subtrees(root_node, parent_node, keep=2)
         if len(infos) >= 2:
-            ap_sorted = sorted(infos, key=lambda x: x["ap_score"])
-            assignment = {f"{side_prefix}_B4": ap_sorted[0], f"{side_prefix}_B5": ap_sorted[-1]}
+            # The two B4/B5 pairs use different anatomical axes: right middle
+            # lobe B4/B5 are lateral/medial, while left lingular B4/B5 are
+            # superior/inferior.  An anterior-posterior sort mislabels both.
+            direction_key = "x_score" if side_prefix == "Rt" else "up_score"
+            ordered = sorted(infos, key=lambda info: info[direction_key])
+            assignment = {
+                f"{side_prefix}_B4": ordered[-1],
+                f"{side_prefix}_B5": ordered[0],
+            }
         elif len(infos) == 1:
             assignment = {f"{side_prefix}_B4+B5": infos[0]}
         else:

@@ -106,6 +106,38 @@ class BranchTopologyTests(unittest.TestCase):
         self.assertEqual(parser.carina,0)
         self.assertEqual(parser.trace_trachea(),[0,1])
 
+    def test_right_middle_b4_b5_use_lateral_medial_ras_axis(self):
+        parser = graph_parser()
+        infos = [
+            {"nodes": {1}, "x_score": -0.4, "up_score": 0.8, "ap_score": 0.9},
+            {"nodes": {2}, "x_score": 0.5, "up_score": -0.8, "ap_score": -0.9},
+        ]
+        parser.distal_subtrees = lambda *_args, **_kwargs: infos
+        named = parser.classify_b45(0, 1, "Rt")
+        self.assertEqual(named["Rt_B4"], {2})
+        self.assertEqual(named["Rt_B5"], {1})
+
+    def test_left_lingula_b4_b5_use_superior_inferior_ras_axis(self):
+        parser = graph_parser()
+        infos = [
+            {"nodes": {1}, "x_score": 0.8, "up_score": -0.6, "ap_score": 0.9},
+            {"nodes": {2}, "x_score": -0.8, "up_score": 0.7, "ap_score": -0.9},
+        ]
+        parser.distal_subtrees = lambda *_args, **_kwargs: infos
+        named = parser.classify_b45(0, 1, "Lt")
+        self.assertEqual(named["Lt_B4"], {2})
+        self.assertEqual(named["Lt_B5"], {1})
+
+    def test_ambiguous_two_branch_upper_lobe_pattern_fails_to_neutral_fallback(self):
+        parser = graph_parser()
+        infos = [
+            {"nodes": {1}, "seed": 1, "up_score": 0.1, "ap_score": 0.0},
+            {"nodes": {2}, "seed": 2, "up_score": 0.05, "ap_score": 0.02},
+        ]
+        parser.distal_subtrees = lambda *_args, **_kwargs: infos
+        with self.assertRaisesRegex(TopologyStructureError, "directional pattern is ambiguous"):
+            parser.classify_b123(0, 1, "Rt")
+
 
 if __name__ == '__main__':
     unittest.main()
